@@ -1829,6 +1829,10 @@ pub const Window = extern struct {
         const child = page.getChild();
         const tab = gobject.ext.cast(Tab, child) orelse return;
 
+        if (!self.private().surface_init) {
+            if (tab.getActiveSurface()) |surface| surfaceInit(surface, self);
+        }
+
         // Attach listeners for the tab.
         _ = Tab.signals.@"close-request".connect(
             tab,
