@@ -294,6 +294,16 @@ pub const Window = extern struct {
         /// The manually overridden title.
         title_override: ?[:0]const u8 = null,
 
+        drag_over_window: bool = false,
+
+        last_detached_page: ?*adw.TabPage = null,
+
+        pending_detach_page: ?*adw.TabPage = null,
+
+        close_if_empty_source: ?c_uint = null,
+
+        detach_dropped_source: ?c_uint = null,
+
         // Template bindings
         tab_overview: *adw.TabOverview,
         tab_bar: *adw.TabBar,
@@ -400,6 +410,8 @@ pub const Window = extern struct {
             .init("prompt-surface-title", actionPromptSurfaceTitle, null),
             .init("prompt-tab-title", actionPromptTabTitle, null),
             .init("prompt-context-tab-title", actionPromptContextTabTitle, null),
+            .init("move-context-tab-to-new-window", actionMoveContextTabToNewWindow, null),
+            .init("move-context-tab-to-other-window", actionMoveContextTabToOtherWindow, null),
             .init("prompt-window-title", actionPromptWindowTitle, null),
             .init("ring-bell", actionRingBell, null),
             .init("split-right", actionSplitRight, null),
@@ -633,6 +645,63 @@ pub const Window = extern struct {
         );
         window.as(gtk.Window).present();
         return true;
+    }
+
+    fn movePageToNewWindow(self: *Self, page: *adw.TabPage) void {
+        const tab_view = self.private().tab_view;
+        if (tab_view.getNPages() <= 1) return;
+        if (tab_view.getPagePosition(page) < 0) return;
+
+        const app = Application.default();
+        const window = Window.new(app, .none);
+
+        tab_view.transferPage(
+            page,
+            window.private().tab_view,
+            0,
+        );
+        window.as(gtk.Window).present();
+    }
+
+    fn isDragOverAnyWindow() bool {
+        const app = Application.default();
+        var current_: ?*glib.List = app.as(gtk.Application).getWindows();
+        while (current_) |node| : (current_ = node.f_next) {
+            const data = node.f_data orelse continue;
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(data));
+            const win = gobject.ext.cast(Self, gtk_window) orelse continue;
+            if (win.private().drag_over_window) return true;
+        }
+        return false;
+    }
+
+    fn detachDroppedPage(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        defer self.unref();
+        const priv = self.private();
+        priv.detach_dropped_source = null;
+        const page = priv.pending_detach_page orelse return 0;
+        priv.pending_detach_page = null;
+        defer page.as(gobject.Object).unref();
+
+        self.movePageToNewWindow(page);
+        return 0;
+    }
+
+    fn dragMotionEnter(
+        _: *gtk.DropControllerMotion,
+        _: f64,
+        _: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        self.private().drag_over_window = true;
+    }
+
+    fn dragMotionLeave(
+        _: *gtk.DropControllerMotion,
+        self: *Self,
+    ) callconv(.c) void {
+        self.private().drag_over_window = false;
     }
 
     pub fn toggleTabOverview(self: *Self) void {
@@ -1433,6 +1502,21 @@ pub const Window = extern struct {
             priv.handle_active_state_source = null;
         }
 
+        if (priv.close_if_empty_source) |v| {
+            if (glib.Source.remove(v) != 0) self.unref();
+            priv.close_if_empty_source = null;
+        }
+
+        if (priv.detach_dropped_source) |v| {
+            if (glib.Source.remove(v) != 0) self.unref();
+            priv.detach_dropped_source = null;
+        }
+
+        if (priv.pending_detach_page) |page| {
+            page.as(gobject.Object).unref();
+            priv.pending_detach_page = null;
+        }
+
         priv.command_palette.deinit();
 
         if (priv.config) |v| {
@@ -1727,6 +1811,20 @@ pub const Window = extern struct {
         _: c_int,
         self: *Self,
     ) callconv(.c) void {
+        {
+            const priv = self.private();
+            const reattached = priv.last_detached_page == page;
+            priv.last_detached_page = null;
+            if (reattached and
+                priv.pending_detach_page == null and
+                !isDragOverAnyWindow())
+            {
+                _ = page.as(gobject.Object).ref();
+                priv.pending_detach_page = page;
+                priv.detach_dropped_source = glib.idleAdd(detachDroppedPage, self.ref());
+            }
+        }
+
         // Get the attached page which must be a Tab object.
         const child = page.getChild();
         const tab = gobject.ext.cast(Tab, child) orelse return;
@@ -1781,6 +1879,8 @@ pub const Window = extern struct {
         _: c_int,
         self: *Self,
     ) callconv(.c) void {
+        self.private().last_detached_page = page;
+
         // We need to get the tab to disconnect the signals.
         const child = page.getChild();
         const tab = gobject.ext.cast(Tab, child) orelse return;
@@ -1844,18 +1944,7 @@ pub const Window = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
-        const priv = self.private();
-        if (priv.tab_view.getNPages() == 0) {
-            // If we have no pages left then we want to close window.
-
-            // If the tab overview is open, then we don't close the window
-            // because its a rather abrupt experience. This also fixes an
-            // issue where dragging out the last tab in the tab overview
-            // won't cause Ghostty to exit.
-            if (priv.tab_overview.getOpen() != 0) return;
-
-            self.as(gtk.Window).close();
-        }
+        self.closeIfEmpty();
     }
     fn setupTabMenu(
         _: *adw.TabView,
@@ -2101,6 +2190,86 @@ pub const Window = extern struct {
         const child = page.getChild();
         const tab = gobject.ext.cast(Tab, child) orelse return;
         tab.promptTabTitle();
+    }
+
+    fn actionMoveContextTabToNewWindow(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const page = self.private().context_menu_page orelse return;
+        if (!self.ownsPage(page)) return;
+        self.movePageToNewWindow(page);
+    }
+
+    fn actionMoveContextTabToOtherWindow(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const page = self.private().context_menu_page orelse return;
+        if (!self.ownsPage(page)) return;
+        const target = self.lastFocusedOtherWindow() orelse return;
+        const target_view = target.private().tab_view;
+        self.private().tab_view.transferPage(
+            page,
+            target_view,
+            target_view.getNPages(),
+        );
+        target.as(gtk.Window).present();
+    }
+
+    fn ownsPage(self: *Self, page: *adw.TabPage) bool {
+        const tab_view = ext.getAncestor(
+            adw.TabView,
+            page.getChild().as(gtk.Widget),
+        ) orelse return false;
+        return tab_view == self.private().tab_view;
+    }
+
+    fn closeIfEmpty(self: *Self) void {
+        const priv = self.private();
+        if (priv.close_if_empty_source != null) return;
+        priv.close_if_empty_source = glib.idleAdd(closeIfEmptyIdle, self.ref());
+    }
+
+    fn closeIfEmptyIdle(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return 0));
+        defer self.unref();
+        const priv = self.private();
+        priv.close_if_empty_source = null;
+        if (priv.tab_view.getNPages() != 0) return 0;
+        if (priv.tab_view.getIsTransferringPage() != 0) return 0;
+
+        // If the tab overview is open, then we don't close the window
+        // because its a rather abrupt experience. This also fixes an
+        // issue where dragging out the last tab in the tab overview
+        // won't cause Ghostty to exit.
+        if (priv.tab_overview.getOpen() != 0) return 0;
+        self.as(gtk.Window).close();
+        return 0;
+    }
+
+    fn tabViewIsTransferringPage(
+        _: *adw.TabView,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        self.closeIfEmpty();
+    }
+
+    fn lastFocusedOtherWindow(self: *Self) ?*Self {
+        const app = Application.default();
+        var current_: ?*glib.List = app.as(gtk.Application).getWindows();
+        while (current_) |node| : (current_ = node.f_next) {
+            const data = node.f_data orelse continue;
+            const gtk_window: *gtk.Window = @ptrCast(@alignCast(data));
+            const win = gobject.ext.cast(Self, gtk_window) orelse continue;
+            if (win == self) continue;
+            if (win.isQuickTerminal()) continue;
+            return win;
+        }
+        return null;
     }
 
     fn actionPromptSurfaceTitle(
@@ -2356,7 +2525,10 @@ pub const Window = extern struct {
             class.bindTemplateCallback("page_detached", &tabViewPageDetached);
             class.bindTemplateCallback("setup_tab_menu", &setupTabMenu);
             class.bindTemplateCallback("tab_create_window", &tabViewCreateWindow);
+            class.bindTemplateCallback("drag_motion_enter", &dragMotionEnter);
+            class.bindTemplateCallback("drag_motion_leave", &dragMotionLeave);
             class.bindTemplateCallback("notify_n_pages", &tabViewNPages);
+            class.bindTemplateCallback("notify_is_transferring_page", &tabViewIsTransferringPage);
             class.bindTemplateCallback("notify_selected_page", &tabViewSelectedPage);
             class.bindTemplateCallback("notify_config", &propConfig);
             class.bindTemplateCallback("notify_fullscreened", &propFullscreened);
